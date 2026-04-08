@@ -3,6 +3,7 @@ import numpy as np
 import os
 import subprocess
 import re
+import difflib # <--- ADD THIS LINE
 
 # ==========================================
 # PART 1: IMAGE CLEANUP & CROPPING
@@ -232,144 +233,164 @@ class ScheduleDataExtractor:
         return " ".join(output.strip().split())
 
     def clean_text(self, text):
-        """Dynamically scrubs OCR noise using smarter pattern recognition."""
+        """Dynamically scrubs OCR noise using fuzzy matching and smarter regex."""
+        # Clean weird symbols but keep letters, numbers, hyphens, and spaces
         cleaned = re.sub(r'[^A-Za-z0-9\-\s]', ' ', text)
-        words = cleaned.split()
+        compact_text = " ".join(cleaned.split())
+
+        if not compact_text:
+            return ""
+
+        # --- DYNAMIC RULE 1: Fuzzy Match Known Schedule Phrases ---
+        # This instantly fixes "Adm1n1strat1ve", "Sreak", and minor OCR typos.
+        known_phrases = [
+            "Administrative Hours", 
+            "Consultation Hours", 
+            "Research Hours", 
+            "Community Extension Hours", 
+            "Break"
+        ]
+        
+        # Check if the text is at least 55% similar to a known phrase
+        matches = difflib.get_close_matches(compact_text, known_phrases, n=1, cutoff=0.55)
+        if matches:
+            return matches[0]
+
+        # --- DYNAMIC RULE 2: Process Course Codes and Sections ---
+        words = compact_text.split()
         final_words = []
 
         for word in words:
-            # FIX 2: Only apply Course Code logic if the word actually LOOKS like a course code
-            if len(word) >= 5 and word[:3].isalpha() and word[3] in '0123456789OoIiLl':
+            # Fix 1: Safely target Course Codes (e.g., PSM107, CHM104A)
+            # Must be 5-8 chars and start with UPPERCASE letters to avoid normal words.
+            if 5 <= len(word) <= 8 and word[:3].isupper():
                 prefix = word[:3]
                 suffix = word[3:]
-                new_suffix = ""
-                for char in suffix:
-                    if char in 'Oo': new_suffix += '0'
-                    elif char in 'IiLl': new_suffix += '1'
-                    else: new_suffix += char
+                # Fix common OCR number/letter mix-ups only in the suffix
+                new_suffix = suffix.replace('O', '0').replace('o', '0').replace('I', '1').replace('i', '1').replace('l', '1')
                 word = prefix + new_suffix
 
-            # DYNAMIC RULE 2: Fix Sections (e.g., iBSN-A -> 1BSN-A)
+            # Fix 2: Fix Sections (e.g., iPSY-A -> 1PSY-A, 2PSY-8 -> 2PSY-B)
             if "-" in word:
                 parts = word.split('-')
-                if len(parts) == 2 and len(parts[0]) > 2:
-                    first_char = parts[0][0]
-                    if first_char in ['i', 'I', 'l', 'L']:
-                        word = '1' + word[1:]
+                if len(parts) == 2:
+                    if parts[0] and parts[0][0] in ['i', 'I', 'l', 'L']:
+                        parts[0] = '1' + parts[0][1:]
+                    if parts[1] == '8':
+                        parts[1] = 'B'
+                    word = "-".join(parts)
 
-            # DYNAMIC RULE 3: Drop noise speckles
-            if len(word) == 1 and word.islower() and word != 'a':
+            # Fix 3: Drop noise speckles (1-2 character lowercase gibberish)
+            if len(word) <= 2 and word.islower() and word not in ['a', 'to']:
                 continue
 
             final_words.append(word)
-            
-        return " ".join(final_words)
+
+        final_string = " ".join(final_words)
+
+        # --- DYNAMIC RULE 3: Garbage Filter (The Saturday Issue) ---
+        # The Saturday block is generating noise from empty table grid lines. 
+        # Gibberish usually breaks down into lots of tiny 1-3 letter chunks.
+        # If we have a long string of mostly tiny words, we erase it.
+        if len(final_words) > 4 and all(len(w) < 4 for w in final_words):
+            return "" 
+
+        return final_string
 
     def extract_data(self):
-        print("[System] Reading Day Headers...")
+            print("[System] Reading Day Headers and Building Grid...")
 
-        # -------------------------------
-        # STEP 1: Generate clean time labels
-        # -------------------------------
-        time_slots = self.generate_time_slots()
+            # -------------------------------
+            # STEP 1: Generate clean time labels (30 slots)
+            # -------------------------------
+            time_slots = self.generate_time_slots()
 
-        # -------------------------------
-        # STEP 2: Sort detected time boxes (TOP → BOTTOM)
-        # -------------------------------
-        sorted_time_boxes = sorted(self.time_boxes, key=lambda b: b[1])
+            # -------------------------------
+            # STEP 2: Read Day Headers
+            # -------------------------------
+            self.days = []
+            for i, box in enumerate(self.day_boxes):
+                text = self.ocr_crop(box, f"day_{i}")
+                if len(text) >= 3:
+                    self.days.append({
+                        'text': text,
+                        'center_x': box[0] + (box[2] // 2),
+                        'bottom_y': box[1] + box[3] # Grab the bottom edge of the day text
+                    })
 
-        # --- THE TIME SHIFT FIX ---
-        # The script misses the first 2 faint rows (6:00 and 6:30), 
-        # so the first box it actually finds is 7:00 AM. 
-        # We offset the time list by 2 so it starts mapping at 07:00 AM.
-        slot_offset = 2 
+            if not self.days:
+                print("[Error] Could not find day headers to anchor the schedule.")
+                return
 
-        # Build mapping: each detected row → actual time slot
-        time_map = []
-        for i, box in enumerate(sorted_time_boxes):
-            # Make sure we don't go out of bounds of the time_slots list
-            if (i + slot_offset) >= len(time_slots):
-                break
-                
-            y = box[1]
-            # Apply the offset here
-            start, end = time_slots[i + slot_offset]
+            # -------------------------------
+            # STEP 3: DYNAMIC GEOMETRIC GRID (The Fix)
+            # -------------------------------
+            # Find the average bottom Y of the day headers. This is where 06:00 AM starts.
+            grid_top_y = sum(d['bottom_y'] for d in self.days) / len(self.days)
             
-            time_map.append({
-                "y": y,
-                "start": start,
-                "end": end
-            })
+            # The grid ends at the bottom of the cropped image
+            grid_bottom_y = self.img_h
+            
+            # Divide the total pixel height by 30 slots to find the exact height of 30 minutes
+            total_grid_height = grid_bottom_y - grid_top_y
+            row_height = total_grid_height / len(time_slots)
 
-        # -------------------------------
-        # STEP 3: Read Day Headers (UNCHANGED)
-        # -------------------------------
-        self.days = []
-        for i, box in enumerate(self.day_boxes):
-            text = self.ocr_crop(box, f"day_{i}")
-            if len(text) >= 3:
-                self.days.append({
-                    'text': text,
-                    'center_x': box[0] + (box[2] // 2)
-                })
-
-        print("\n" + "="*50)
-        print(" EXTRACTED SCHEDULE EVENTS")
-        print("="*50)
-
-        # -------------------------------
-        # STEP 4: Process Events
-        # -------------------------------
-        for i, event in enumerate(self.event_boxes):
-            x, y, w, h = event
-
-            # OCR EVENT TEXT
-            raw_event_text = self.ocr_crop(event, f"event_{i}")
-            event_text = self.clean_text(raw_event_text)
-
-            if len(event_text) < 4:
-                continue
+            print("\n" + "="*50)
+            print(" EXTRACTED SCHEDULE EVENTS")
+            print("="*50)
 
             # -------------------------------
-            # STEP 5: FIND DAY (UNCHANGED)
+            # STEP 4: Process Events
             # -------------------------------
-            event_center_x = x + (w // 2)
+            for i, event in enumerate(self.event_boxes):
+                x, y, w, h = event
 
-            day_text = "Unknown Day"
-            if self.days:
-                closest_day = min(
-                    self.days,
-                    key=lambda d: abs(d['center_x'] - event_center_x)
-                )
-                day_text = closest_day['text']
+                # OCR EVENT TEXT
+                raw_event_text = self.ocr_crop(event, f"event_{i}")
+                event_text = self.clean_text(raw_event_text)
 
-            # -------------------------------
-            # STEP 6: TIME MAPPING (FINAL FIX)
-            # -------------------------------
-            if not time_map:
-                continue
+                if len(event_text) < 4:
+                    continue
 
-            row_h = abs(time_map[1]['y'] - time_map[0]['y'])
+                # FIND DAY
+                event_center_x = x + (w // 2)
+                day_text = "Unknown Day"
+                if self.days:
+                    closest_day = min(
+                        self.days,
+                        key=lambda d: abs(d['center_x'] - event_center_x)
+                    )
+                    day_text = closest_day['text']
 
-            closest_start = min(time_map, key=lambda t: abs(t['y'] - (y + row_h/2)))
-            closest_end   = min(time_map, key=lambda t: abs(t['y'] - (y + h - row_h/2)))
+                # -------------------------------
+                # STEP 5: MATH-BASED TIME MAPPING
+                # -------------------------------
+                # We determine the start and end by dividing the Y pixels by the row height
+                start_index = int(round((y - grid_top_y) / row_height))
+                end_index = int(round((y + h - grid_top_y) / row_height))
 
-            start_time_text = closest_start['start']
-            end_time_text = closest_end['end']
+                # Clamp indices to ensure they don't crash if an event touches the exact bottom edge
+                start_index = max(0, min(start_index, len(time_slots) - 1))
+                end_index = max(start_index + 1, min(end_index, len(time_slots)))
 
-            # -------------------------------
-            # OUTPUT
-            # -------------------------------
-            print(f"DAY:   {day_text}")
-            print(f"TIME:  {start_time_text} to {end_time_text}")
-            print(f"EVENT: {event_text}")
-            print("-" * 50)
+                start_time_text = time_slots[start_index][0]
+                
+                # The time_slots tuple holds (start_time, end_time). We grab the end_time of the final block.
+                end_time_text = time_slots[end_index - 1][1]
+
+                # -------------------------------
+                # OUTPUT
+                # -------------------------------
+                print(f"DAY:   {day_text}")
+                print(f"TIME:  {start_time_text} to {end_time_text}")
+                print(f"EVENT: {event_text}")
+                print("-" * 50)
 
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    input_filename = "schedule_image_1.jpg"
+    input_filename = "new_sched_2.jpg"
     
     color_output_filename = "schedule_final_colored.jpg"
     bw_output_filename = "schedule_final_bw_mask.jpg"
