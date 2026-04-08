@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import os
 import subprocess
+import re
 
 # ==========================================
 # PART 1: IMAGE CLEANUP & CROPPING
@@ -12,7 +13,7 @@ class TableLinesRemover:
         self.original = image.copy()
 
     def execute(self):
-        self.isolate_green_blocks()
+        self.isolate_color_blocks()
         self.grayscale_image()
         self.threshold_image()
         self.invert_image()
@@ -20,23 +21,25 @@ class TableLinesRemover:
         self.erode_horizontal_lines()
         self.combine_eroded_images()
         self.erase_lines_from_original()
-        self.restore_green_blocks()
+        self.restore_color_blocks()
         self.crop_to_largest_table()
         return self.final_image
 
-    def isolate_green_blocks(self):
+    def isolate_color_blocks(self):
         hsv = cv2.cvtColor(self.original, cv2.COLOR_BGR2HSV)
-        lower_green = np.array([35, 40, 40])
-        upper_green = np.array([85, 255, 255])
-        raw_green_mask = cv2.inRange(hsv, lower_green, upper_green)
         
-        contours, _ = cv2.findContours(raw_green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        self.solid_green_mask = np.zeros_like(raw_green_mask)
+        # FIX 1: Lowered brightness to 30 to catch Dark Green, Dark Red, Blue, etc.
+        lower_color = np.array([0, 30, 30])
+        upper_color = np.array([180, 255, 255])
+        raw_color_mask = cv2.inRange(hsv, lower_color, upper_color)
+        
+        contours, _ = cv2.findContours(raw_color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.solid_color_mask = np.zeros_like(raw_color_mask)
         for cnt in contours:
             if cv2.contourArea(cnt) > 200:
-                cv2.drawContours(self.solid_green_mask, [cnt], -1, 255, -1)
+                cv2.drawContours(self.solid_color_mask, [cnt], -1, 255, -1)
         
-        self.isolated_green = cv2.bitwise_and(self.original, self.original, mask=self.solid_green_mask)
+        self.isolated_colors = cv2.bitwise_and(self.original, self.original, mask=self.solid_color_mask)
 
     def grayscale_image(self):
         self.grey = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
@@ -66,10 +69,10 @@ class TableLinesRemover:
         self.image_without_lines = self.original.copy()
         self.image_without_lines[self.combined_lines == 255] = [255, 255, 255]
 
-    def restore_green_blocks(self):
-        inv_green_mask = cv2.bitwise_not(self.solid_green_mask)
-        bg_area = cv2.bitwise_and(self.image_without_lines, self.image_without_lines, mask=inv_green_mask)
-        self.final_image = cv2.add(bg_area, self.isolated_green)
+    def restore_color_blocks(self):
+        inv_color_mask = cv2.bitwise_not(self.solid_color_mask)
+        bg_area = cv2.bitwise_and(self.image_without_lines, self.image_without_lines, mask=inv_color_mask)
+        self.final_image = cv2.add(bg_area, self.isolated_colors)
 
     def crop_to_largest_table(self):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
@@ -98,21 +101,20 @@ class TableLinesRemover:
 # ==========================================
 # PART 2: OCR & GEOMETRIC DATA EXTRACTION
 # ==========================================
-import re
 class ScheduleDataExtractor:
     def __init__(self, cropped_image):
         self.image = cropped_image
         self.img_h, self.img_w = self.image.shape[:2]
 
-        # 1. FIND THE GREEN BLOCKS
+        # 1. FIND THE COLORED BLOCKS (Red, Green, Yellow, Blue, etc.)
         hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        lower_green = np.array([30, 30, 30])
-        upper_green = np.array([90, 255, 255])
-        self.green_mask = cv2.inRange(hsv, lower_green, upper_green)
+        lower_color = np.array([0, 30, 30])
+        upper_color = np.array([180, 255, 255])
+        self.color_mask = cv2.inRange(hsv, lower_color, upper_color)
 
         # 2. CREATE PURE TEXT MASK
         text_only_image = self.image.copy()
-        text_only_image[self.green_mask == 255] = [255, 255, 255]
+        text_only_image[self.color_mask == 255] = [255, 255, 255] # Erase all colors
         text_only_gray = cv2.cvtColor(text_only_image, cv2.COLOR_BGR2GRAY)
         _, self.ocr_mask = cv2.threshold(text_only_gray, 130, 255, cv2.THRESH_BINARY_INV)
         
@@ -122,6 +124,24 @@ class ScheduleDataExtractor:
         print("\n[System] Locating schedule boundaries...")
         self.categorize_boxes()
         self.extract_data()
+        
+    def generate_time_slots(self):
+        times = []
+        hour = 6
+        minute = 0
+
+        while hour < 21:
+            start = f"{hour:02d}:{minute:02d}"
+            
+            minute += 30
+            if minute == 60:
+                minute = 0
+                hour += 1
+            
+            end = f"{hour:02d}:{minute:02d}"
+            times.append((start, end))
+        
+        return times
 
     def categorize_boxes(self):
         self.time_boxes = []
@@ -129,17 +149,21 @@ class ScheduleDataExtractor:
         self.event_boxes = []
 
         time_col_width = int(self.img_w * 0.18)  
-        header_row_height = int(self.img_h * 0.08)  
+        header_row_height = int(self.img_h * 0.10)
 
-        # --- STEP A: Add Green Event Blocks ---
-        shrink_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        shrunk_green = cv2.erode(self.green_mask, shrink_kernel, iterations=1)
+        # --- STEP A: Add Colored Event Blocks ---
+        # THE FIX: Removed the "MORPH_CLOSE" superglue. We now strictly Erode (Scalpel)
+        # to slice apart touching columns (Thurs/Fri) and touching rows (Tuesday).
+        shrink_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
+        shrunk_color = cv2.erode(self.color_mask, shrink_kernel, iterations=1)
 
-        contours, _ = cv2.findContours(shrunk_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(shrunk_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             if w > 15 and h > 15:  
-                pad = 2
+                # We eroded by an 8x8 kernel (shaving roughly 4 pixels off all sides)
+                # We add 4 pixels of padding back here so we don't chop the text edges.
+                pad = 4
                 self.event_boxes.append((x - pad, y - pad, w + pad*2, h + pad*2))
 
         # --- STEP B: Find Time Slots (Left Zone) ---
@@ -167,7 +191,7 @@ class ScheduleDataExtractor:
             if w > 10 and h > 5:
                 self.day_boxes.append((x, y, w, h))
 
-        # --- STEP D: Find Floating Text Events (Middle Zone) ---
+        # --- STEP D: Find Floating Text Events (Middle Zone - "Breaks", etc.) ---
         event_zone = self.ocr_mask.copy()
         event_zone[:header_row_height, :] = 0 
         event_zone[:, :time_col_width] = 0 
@@ -181,14 +205,14 @@ class ScheduleDataExtractor:
             if w < 10 or h < 10: 
                 continue
 
-            is_inside_green_box = False
+            is_inside_color_box = False
             center_x, center_y = x + (w // 2), y + (h // 2)
             for (gx, gy, gw, gh) in self.event_boxes:
                 if gx <= center_x <= gx + gw and gy <= center_y <= gy + gh:
-                    is_inside_green_box = True
+                    is_inside_color_box = True
                     break
             
-            if not is_inside_green_box:
+            if not is_inside_color_box:
                 self.event_boxes.append((x, y, w, h))
 
     def ocr_crop(self, box, index):
@@ -208,104 +232,144 @@ class ScheduleDataExtractor:
         return " ".join(output.strip().split())
 
     def clean_text(self, text):
-        """Dynamically scrubs OCR noise using pattern recognition."""
-        
-        # 1. Strip out random lines, borders, and noise symbols
-        # Keeps ONLY Letters, Numbers, Hyphens, and Spaces
+        """Dynamically scrubs OCR noise using smarter pattern recognition."""
         cleaned = re.sub(r'[^A-Za-z0-9\-\s]', ' ', text)
-
-        # 2. Split into individual words to inspect them
         words = cleaned.split()
         final_words = []
 
         for word in words:
-            # --- DYNAMIC RULE 1: The Course Code Fixer ---
-            # If a word is 5+ chars long and the first 3 chars are letters (e.g., "BCH1O4")
-            # Tesseract likely misread a 0 as an O, or a 1 as an I in the numeric part.
-            if len(word) >= 5 and word[:3].isalpha():
+            # FIX 2: Only apply Course Code logic if the word actually LOOKS like a course code
+            if len(word) >= 5 and word[:3].isalpha() and word[3] in '0123456789OoIiLl':
                 prefix = word[:3]
-                # Force 'O' to '0' and 'I' to '1' in the numeric suffix
-                suffix = word[3:].replace('O', '0').replace('o', '0').replace('I', '1').replace('i', '1')
-                word = prefix + suffix
+                suffix = word[3:]
+                new_suffix = ""
+                for char in suffix:
+                    if char in 'Oo': new_suffix += '0'
+                    elif char in 'IiLl': new_suffix += '1'
+                    else: new_suffix += char
+                word = prefix + new_suffix
 
-            # --- DYNAMIC RULE 2: The Section Fixer ---
-            # If a word looks like a section block (e.g., "iBSN-A" instead of "1BSN-A")
-            # and ends with "-[Letter]", fix the starting hallucination
-            if "-" in word and len(word) >= 5:
-                if word[0].lower() == 'i' or word[0].lower() == 'l':
-                    word = '1' + word[1:]
+            # DYNAMIC RULE 2: Fix Sections (e.g., iBSN-A -> 1BSN-A)
+            if "-" in word:
+                parts = word.split('-')
+                if len(parts) == 2 and len(parts[0]) > 2:
+                    first_char = parts[0][0]
+                    if first_char in ['i', 'I', 'l', 'L']:
+                        word = '1' + word[1:]
 
-            # --- DYNAMIC RULE 3: The Speckle Dropper ---
-            # Ignore isolated single letters caused by dust/noise (except A, B, C for sections)
-            if len(word) == 1 and word.upper() not in "ABC123":
+            # DYNAMIC RULE 3: Drop noise speckles
+            if len(word) == 1 and word.islower() and word != 'a':
                 continue
 
             final_words.append(word)
-
-        # 3. Collapse extra spaces and return the clean string
+            
         return " ".join(final_words)
 
     def extract_data(self):
         print("[System] Reading Day Headers...")
+
+        # -------------------------------
+        # STEP 1: Generate clean time labels
+        # -------------------------------
+        time_slots = self.generate_time_slots()
+
+        # -------------------------------
+        # STEP 2: Sort detected time boxes (TOP → BOTTOM)
+        # -------------------------------
+        sorted_time_boxes = sorted(self.time_boxes, key=lambda b: b[1])
+
+        # --- THE TIME SHIFT FIX ---
+        # The script misses the first 2 faint rows (6:00 and 6:30), 
+        # so the first box it actually finds is 7:00 AM. 
+        # We offset the time list by 2 so it starts mapping at 07:00 AM.
+        slot_offset = 2 
+
+        # Build mapping: each detected row → actual time slot
+        time_map = []
+        for i, box in enumerate(sorted_time_boxes):
+            # Make sure we don't go out of bounds of the time_slots list
+            if (i + slot_offset) >= len(time_slots):
+                break
+                
+            y = box[1]
+            # Apply the offset here
+            start, end = time_slots[i + slot_offset]
+            
+            time_map.append({
+                "y": y,
+                "start": start,
+                "end": end
+            })
+
+        # -------------------------------
+        # STEP 3: Read Day Headers (UNCHANGED)
+        # -------------------------------
         self.days = []
         for i, box in enumerate(self.day_boxes):
             text = self.ocr_crop(box, f"day_{i}")
             if len(text) >= 3:
-                self.days.append({'text': text, 'center_x': box[0] + (box[2] // 2)})
-
-        print("[System] Reading Time Slots...")
-        self.times = []
-        for i, box in enumerate(self.time_boxes):
-            text = self.ocr_crop(box, f"time_{i}")
-            if len(text) >= 5:
-                self.times.append({
-                    'text': text, 
-                    'y': box[1], 
-                    'bottom': box[1] + box[3]
+                self.days.append({
+                    'text': text,
+                    'center_x': box[0] + (box[2] // 2)
                 })
 
         print("\n" + "="*50)
         print(" EXTRACTED SCHEDULE EVENTS")
         print("="*50)
 
+        # -------------------------------
+        # STEP 4: Process Events
+        # -------------------------------
         for i, event in enumerate(self.event_boxes):
             x, y, w, h = event
-            
-            # ---> Get raw text from OCR and immediately clean it! <---
+
+            # OCR EVENT TEXT
             raw_event_text = self.ocr_crop(event, f"event_{i}")
             event_text = self.clean_text(raw_event_text)
-            
-            if len(event_text) < 3: 
+
+            if len(event_text) < 4:
                 continue
 
+            # -------------------------------
+            # STEP 5: FIND DAY (UNCHANGED)
+            # -------------------------------
             event_center_x = x + (w // 2)
+
             day_text = "Unknown Day"
             if self.days:
-                closest_day = min(self.days, key=lambda d: abs(d['center_x'] - event_center_x))
+                closest_day = min(
+                    self.days,
+                    key=lambda d: abs(d['center_x'] - event_center_x)
+                )
                 day_text = closest_day['text']
 
-            start_time_text = "Unknown Start"
-            end_time_text = "Unknown End"
-            if self.times:
-                closest_start = min(self.times, key=lambda t: abs(t['y'] - y))
-                closest_end = min(self.times, key=lambda t: abs(t['bottom'] - (y + h)))
-                
-                raw_start = closest_start['text']
-                raw_end = closest_end['text']
-                start_time_text = raw_start.split('-')[0].strip() if '-' in raw_start else raw_start
-                end_time_text = raw_end.split('-')[-1].strip() if '-' in raw_end else raw_end
+            # -------------------------------
+            # STEP 6: TIME MAPPING (FINAL FIX)
+            # -------------------------------
+            if not time_map:
+                continue
 
+            row_h = abs(time_map[1]['y'] - time_map[0]['y'])
+
+            closest_start = min(time_map, key=lambda t: abs(t['y'] - (y + row_h/2)))
+            closest_end   = min(time_map, key=lambda t: abs(t['y'] - (y + h - row_h/2)))
+
+            start_time_text = closest_start['start']
+            end_time_text = closest_end['end']
+
+            # -------------------------------
+            # OUTPUT
+            # -------------------------------
             print(f"DAY:   {day_text}")
             print(f"TIME:  {start_time_text} to {end_time_text}")
             print(f"EVENT: {event_text}")
             print("-" * 50)
 
-
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    input_filename = "schedule_image.jpg"
+    input_filename = "schedule_image_1.jpg"
     
     color_output_filename = "schedule_final_colored.jpg"
     bw_output_filename = "schedule_final_bw_mask.jpg"
