@@ -262,12 +262,14 @@ class ScheduleDataExtractor:
         # --- STEP D: Find Floating Text Events (Middle Zone - "Breaks", etc.) ---
         event_zone = self.ocr_mask.copy()
         event_zone[:header_row_height, :] = 0 
-        event_zone[:, :time_col_width] = 0 
+        event_zone[:, :time_col_width] = 0
         
-        event_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        # 1. Use a very conservative kernel to capture individual words safely
+        event_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)) 
         event_dilated = cv2.dilate(event_zone, event_kernel, iterations=1)
         event_contours, _ = cv2.findContours(event_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        floating_boxes = []
         for cnt in event_contours:
             x, y, w, h = cv2.boundingRect(cnt)
             if w < 10 or h < 10: 
@@ -281,7 +283,46 @@ class ScheduleDataExtractor:
                     break
             
             if not is_inside_color_box:
-                self.event_boxes.append((x, y, w, h))
+                # Store as a list so we can modify it during the merge step
+                floating_boxes.append([x, y, w, h])
+
+        # --- STEP E: Smart Merge Vertically Stacked Text ---
+        # Logically combine words that are in the same column and close together
+        merged_any = True
+        while merged_any:
+            merged_any = False
+            for i in range(len(floating_boxes)):
+                for j in range(i + 1, len(floating_boxes)):
+                    b1 = floating_boxes[i]
+                    b2 = floating_boxes[j]
+                    
+                    # Check if they share the same column (X coordinates overlap > 50%)
+                    x_overlap = max(0, min(b1[0]+b1[2], b2[0]+b2[2]) - max(b1[0], b2[0]))
+                    min_width = min(b1[2], b2[2])
+                    
+                    if min_width > 0 and (x_overlap / min_width) > 0.5:
+                        
+                        # Check vertical distance between the two boxes
+                        y_dist = max(b1[1], b2[1]) - min(b1[1]+b1[3], b2[1]+b2[3])
+                        
+                        # If vertical gap is <= 30 pixels, they belong to the same block!
+                        if -10 <= y_dist <= 30: 
+                            # Create a new bounding box that stretches over both
+                            nx = min(b1[0], b2[0])
+                            ny = min(b1[1], b2[1])
+                            nw = max(b1[0]+b1[2], b2[0]+b2[2]) - nx
+                            nh = max(b1[1]+b1[3], b2[1]+b2[3]) - ny
+                            
+                            floating_boxes[i] = [nx, ny, nw, nh]
+                            del floating_boxes[j]
+                            merged_any = True
+                            break
+                if merged_any:
+                    break
+                    
+        # Add the smartly merged boxes to our final extraction list
+        for box in floating_boxes:
+            self.event_boxes.append(tuple(box))
 
     def ocr_crop(self, box, index):
         x, y, w, h = box
@@ -439,7 +480,7 @@ class ScheduleDataExtractor:
 # MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    input_filename = "new_sched_2.jpg"
+    input_filename = "new_sched_1.jpg"
     
     color_output_filename = "schedule_final_colored.jpg"
     bw_output_filename = "schedule_final_bw_mask.jpg"
