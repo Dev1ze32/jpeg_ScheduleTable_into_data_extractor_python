@@ -173,14 +173,14 @@ class ScheduleDataExtractor:
                     family_ink[labels == lbl] = 255
 
             # HEALING STEP FOR GREEN
-            if i == 0:
-                # 1. Swell the strokes
-                repair_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
-                family_ink = cv2.dilate(family_ink, repair_kernel, iterations=1)
+            #if i == 0:
+             #   # 1. Swell the strokes
+               # repair_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
+               # family_ink = cv2.dilate(family_ink, repair_kernel, iterations=1)
                 
                 # 2. Fill gaps inside the letters
-                close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-                family_ink = cv2.morphologyEx(family_ink, cv2.MORPH_CLOSE, close_kernel)
+              #  close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+              #  family_ink = cv2.morphologyEx(family_ink, cv2.MORPH_CLOSE, close_kernel)
 
             ink_in_color = cv2.bitwise_or(ink_in_color, family_ink)
 
