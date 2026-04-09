@@ -133,32 +133,33 @@ class ScheduleDataExtractor:
             self.color_mask = cv2.bitwise_or(self.color_mask, fam_mask)
 
             # Tailor the smoothing and thresholding per color family
-            if i == 0:  # Dark Green: Aggressive noise kill required
-                smooth = cv2.medianBlur(gray_full, 5) # Heavy blur to melt static
-                block_size = 19
-                c_val = 11    # Strict C-val prevents grabbing background texture
-                min_area = 15 # Strict size filter
+            if i == 0:  # Dark Green
+                # Target the "blackest" pixels and make them white using a global threshold.
+                smooth = cv2.medianBlur(gray_full, 3)
+                
+                # THRESH_BINARY_INV turns anything darker than a value of 75 into pure white (255).
+                # The black text easily falls under 75, while the green background stays above it.
+                _, color_text_thresh = cv2.threshold(smooth, 40, 255, cv2.THRESH_BINARY_INV)
+                min_area = 5  # We can lower this now since the global threshold creates less static
                 min_h = 6
+                
             elif i == 1:  # Blue
                 smooth = cv2.medianBlur(gray_full, 5)
                 smooth = cv2.bilateralFilter(smooth, 9, 75, 75)
-                block_size = 15
-                c_val = 14
+                color_text_thresh = cv2.adaptiveThreshold(
+                    smooth, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 14
+                )
                 min_area = 15
                 min_h = 6
+                
             else:         # Red & Yellow
                 smooth = cv2.medianBlur(gray_full, 5)
-                block_size = 15
-                c_val = 8
+                color_text_thresh = cv2.adaptiveThreshold(
+                    smooth, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 8
+                )
                 min_area = 12
                 min_h = 6
 
-            color_text_thresh = cv2.adaptiveThreshold(
-                smooth, 255, 
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY_INV, 
-                block_size, c_val
-            )
             raw_ink = cv2.bitwise_and(color_text_thresh, color_text_thresh, mask=fam_mask)
 
             # Filter out all noise using connected components
@@ -171,9 +172,7 @@ class ScheduleDataExtractor:
                 if area >= min_area and h >= min_h:
                     family_ink[labels == lbl] = 255
 
-            # HEALING STEP FOR GREEN: 
-            # Now that the noise is 100% dead, we can safely inflate and glue the surviving text 
-            # fragments back together so Tesseract can easily read them.
+            # HEALING STEP FOR GREEN
             if i == 0:
                 # 1. Swell the strokes
                 repair_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
