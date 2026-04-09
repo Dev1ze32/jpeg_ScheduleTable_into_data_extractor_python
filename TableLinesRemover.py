@@ -3,7 +3,7 @@ import numpy as np
 import os
 import subprocess
 import re
-import difflib # <--- ADD THIS LINE
+import difflib
 
 # ==========================================
 # PART 1: IMAGE CLEANUP & CROPPING
@@ -26,20 +26,18 @@ class TableLinesRemover:
         self.crop_to_largest_table()
         return self.final_image
 
+    def _make_solid_color_mask(self, hsv, min_area=200):
+        raw = cv2.inRange(hsv, np.array([0, 30, 30]), np.array([180, 255, 255]))
+        contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        solid = np.zeros_like(raw)
+        for cnt in contours:
+            if cv2.contourArea(cnt) > min_area:
+                cv2.drawContours(solid, [cnt], -1, 255, -1)
+        return solid
+
     def isolate_color_blocks(self):
         hsv = cv2.cvtColor(self.original, cv2.COLOR_BGR2HSV)
-        
-        # FIX 1: Lowered brightness to 30 to catch Dark Green, Dark Red, Blue, etc.
-        lower_color = np.array([0, 30, 30])
-        upper_color = np.array([180, 255, 255])
-        raw_color_mask = cv2.inRange(hsv, lower_color, upper_color)
-        
-        contours, _ = cv2.findContours(raw_color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        self.solid_color_mask = np.zeros_like(raw_color_mask)
-        for cnt in contours:
-            if cv2.contourArea(cnt) > 200:
-                cv2.drawContours(self.solid_color_mask, [cnt], -1, 255, -1)
-        
+        self.solid_color_mask = self._make_solid_color_mask(hsv)
         self.isolated_colors = cv2.bitwise_and(self.original, self.original, mask=self.solid_color_mask)
 
     def grayscale_image(self):
@@ -107,18 +105,95 @@ class ScheduleDataExtractor:
         self.image = cropped_image
         self.img_h, self.img_w = self.image.shape[:2]
 
-        # 1. FIND THE COLORED BLOCKS (Red, Green, Yellow, Blue, etc.)
         hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        lower_color = np.array([0, 30, 30])
-        upper_color = np.array([180, 255, 255])
-        self.color_mask = cv2.inRange(hsv, lower_color, upper_color)
-
-        # 2. CREATE PURE TEXT MASK
-        text_only_image = self.image.copy()
-        text_only_image[self.color_mask == 255] = [255, 255, 255] # Erase all colors
-        text_only_gray = cv2.cvtColor(text_only_image, cv2.COLOR_BGR2GRAY)
-        _, self.ocr_mask = cv2.threshold(text_only_gray, 130, 255, cv2.THRESH_BINARY_INV)
+        gray_full = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
         
+        # 1. DEFINE COLOR FAMILIES FOR BOTH MASKING AND CATEGORIZATION
+        self.color_families = [
+            # 0: Dark Green (PSM113 / RM319) 
+            cv2.inRange(hsv, np.array([35, 40, 20]), np.array([85, 255, 200])),
+            # 1: Blue (Administrative Hours)
+            cv2.inRange(hsv, np.array([90, 40, 40]), np.array([130, 255, 255])),
+            # 2: Red/Peach (PSE105 / 4PSY)
+            cv2.bitwise_or(
+                cv2.inRange(hsv, np.array([0, 40, 100]), np.array([15, 255, 255])),
+                cv2.inRange(hsv, np.array([160, 40, 100]), np.array([180, 255, 255]))
+            ),
+            # 3: Yellow/Beige (Research / Comm Ext) 
+            cv2.inRange(hsv, np.array([15, 20, 150]), np.array([35, 255, 255]))
+        ]
+
+        # --- Zone B: Inside Colored Blocks (Per-Color Extraction & Noise Filtering) ---
+        self.color_mask = np.zeros(self.image.shape[:2], dtype=np.uint8)
+        ink_in_color = np.zeros(self.image.shape[:2], dtype=np.uint8)
+        
+        for i, fam_mask in enumerate(self.color_families):
+            clean_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            fam_mask = cv2.morphologyEx(fam_mask, cv2.MORPH_CLOSE, clean_kernel)
+            self.color_mask = cv2.bitwise_or(self.color_mask, fam_mask)
+
+            # Tailor the smoothing and thresholding per color family
+            if i == 0:  # Dark Green: Aggressive noise kill required
+                smooth = cv2.medianBlur(gray_full, 5) # Heavy blur to melt static
+                block_size = 19
+                c_val = 11    # Strict C-val prevents grabbing background texture
+                min_area = 15 # Strict size filter
+                min_h = 6
+            elif i == 1:  # Blue
+                smooth = cv2.medianBlur(gray_full, 5)
+                smooth = cv2.bilateralFilter(smooth, 9, 75, 75)
+                block_size = 15
+                c_val = 14
+                min_area = 15
+                min_h = 6
+            else:         # Red & Yellow
+                smooth = cv2.medianBlur(gray_full, 5)
+                block_size = 15
+                c_val = 8
+                min_area = 12
+                min_h = 6
+
+            color_text_thresh = cv2.adaptiveThreshold(
+                smooth, 255, 
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY_INV, 
+                block_size, c_val
+            )
+            raw_ink = cv2.bitwise_and(color_text_thresh, color_text_thresh, mask=fam_mask)
+
+            # Filter out all noise using connected components
+            family_ink = np.zeros(self.image.shape[:2], dtype=np.uint8)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_ink, connectivity=8)
+            
+            for lbl in range(1, num_labels):
+                area = stats[lbl, cv2.CC_STAT_AREA]
+                h = stats[lbl, cv2.CC_STAT_HEIGHT]
+                if area >= min_area and h >= min_h:
+                    family_ink[labels == lbl] = 255
+
+            # HEALING STEP FOR GREEN: 
+            # Now that the noise is 100% dead, we can safely inflate and glue the surviving text 
+            # fragments back together so Tesseract can easily read them.
+            if i == 0:
+                # 1. Swell the strokes
+                repair_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
+                family_ink = cv2.dilate(family_ink, repair_kernel, iterations=1)
+                
+                # 2. Fill gaps inside the letters
+                close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                family_ink = cv2.morphologyEx(family_ink, cv2.MORPH_CLOSE, close_kernel)
+
+            ink_in_color = cv2.bitwise_or(ink_in_color, family_ink)
+
+        # --- Zone A: White background (Outside colored blocks) ---
+        _, bw_outside = cv2.threshold(gray_full, 150, 255, cv2.THRESH_BINARY_INV)
+        bw_outside_masked = cv2.bitwise_and(bw_outside, bw_outside, mask=cv2.bitwise_not(self.color_mask))
+        
+        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        bw_opened = cv2.morphologyEx(bw_outside_masked, cv2.MORPH_OPEN, noise_kernel, iterations=1)
+
+        # --- Combine all zones ---
+        self.ocr_mask = cv2.bitwise_or(bw_opened, ink_in_color)
         self.bw_image_for_viewing = cv2.bitwise_not(self.ocr_mask)
 
     def execute(self):
@@ -130,18 +205,14 @@ class ScheduleDataExtractor:
         times = []
         hour = 6
         minute = 0
-
         while hour < 21:
             start = f"{hour:02d}:{minute:02d}"
-            
             minute += 30
             if minute == 60:
                 minute = 0
                 hour += 1
-            
             end = f"{hour:02d}:{minute:02d}"
             times.append((start, end))
-        
         return times
 
     def categorize_boxes(self):
@@ -153,19 +224,16 @@ class ScheduleDataExtractor:
         header_row_height = int(self.img_h * 0.10)
 
         # --- STEP A: Add Colored Event Blocks ---
-        # THE FIX: Removed the "MORPH_CLOSE" superglue. We now strictly Erode (Scalpel)
-        # to slice apart touching columns (Thurs/Fri) and touching rows (Tuesday).
-        shrink_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
-        shrunk_color = cv2.erode(self.color_mask, shrink_kernel, iterations=1)
-
-        contours, _ = cv2.findContours(shrunk_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w > 15 and h > 15:  
-                # We eroded by an 8x8 kernel (shaving roughly 4 pixels off all sides)
-                # We add 4 pixels of padding back here so we don't chop the text edges.
-                pad = 4
-                self.event_boxes.append((x - pad, y - pad, w + pad*2, h + pad*2))
+        clean_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        for family_mask in self.color_families:
+            opened = cv2.morphologyEx(family_mask, cv2.MORPH_OPEN, clean_kernel)
+            contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w > 20 and h > 20:  
+                    pad = 4
+                    self.event_boxes.append((x - pad, y - pad, w + pad*2, h + pad*2))
 
         # --- STEP B: Find Time Slots (Left Zone) ---
         time_zone = self.ocr_mask.copy()
@@ -189,7 +257,7 @@ class ScheduleDataExtractor:
         
         for cnt in day_contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            if w > 10 and h > 5:
+            if w > 40 and h > 10:
                 self.day_boxes.append((x, y, w, h))
 
         # --- STEP D: Find Floating Text Events (Middle Zone - "Breaks", etc.) ---
@@ -197,7 +265,7 @@ class ScheduleDataExtractor:
         event_zone[:header_row_height, :] = 0 
         event_zone[:, :time_col_width] = 0 
         
-        event_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 15))
+        event_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
         event_dilated = cv2.dilate(event_zone, event_kernel, iterations=1)
         event_contours, _ = cv2.findContours(event_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -223,26 +291,27 @@ class ScheduleDataExtractor:
         x2, y2 = min(self.img_w, x + w + pad), min(self.img_h, y + h + pad)
 
         crop = self.ocr_mask[y1:y2, x1:x2]
-        crop_for_ocr = cv2.bitwise_not(crop) 
-        crop_for_ocr = cv2.resize(crop_for_ocr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        crop_for_ocr = cv2.bitwise_not(crop)
 
+        crop_h, crop_w = crop_for_ocr.shape[:2]
+        min_dim = min(crop_w, crop_h)
+        scale = 4.0 if min_dim < 30 else 3.0
+        crop_for_ocr = cv2.resize(crop_for_ocr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        psm = 7 if (crop_h < 20 or crop_w < 60) else 6
         path = f"./process_images/ocr_table_tool/crop_{index}.jpg"
         cv2.imwrite(path, crop_for_ocr)
 
-        output = subprocess.getoutput(f'tesseract "{path}" stdout --psm 6')
+        output = subprocess.getoutput(f'tesseract "{path}" stdout --psm {psm}')
         return " ".join(output.strip().split())
 
     def clean_text(self, text):
-        """Dynamically scrubs OCR noise using fuzzy matching and smarter regex."""
-        # Clean weird symbols but keep letters, numbers, hyphens, and spaces
         cleaned = re.sub(r'[^A-Za-z0-9\-\s]', ' ', text)
         compact_text = " ".join(cleaned.split())
 
         if not compact_text:
             return ""
 
-        # --- DYNAMIC RULE 1: Fuzzy Match Known Schedule Phrases ---
-        # This instantly fixes "Adm1n1strat1ve", "Sreak", and minor OCR typos.
         known_phrases = [
             "Administrative Hours", 
             "Consultation Hours", 
@@ -251,63 +320,67 @@ class ScheduleDataExtractor:
             "Break"
         ]
         
-        # Check if the text is at least 55% similar to a known phrase
-        matches = difflib.get_close_matches(compact_text, known_phrases, n=1, cutoff=0.55)
+        matches = difflib.get_close_matches(compact_text, known_phrases, n=1, cutoff=0.65)
         if matches:
             return matches[0]
 
-        # --- DYNAMIC RULE 2: Process Course Codes and Sections ---
+        import re as _re
         words = compact_text.split()
         final_words = []
+        known_prefixes = ['PSM', 'PSE', 'RM', 'PSY']
 
         for word in words:
-            # Fix 1: Safely target Course Codes (e.g., PSM107, CHM104A)
-            # Must be 5-8 chars and start with UPPERCASE letters to avoid normal words.
-            if 5 <= len(word) <= 8 and word[:3].isupper():
-                prefix = word[:3]
-                suffix = word[3:]
-                # Fix common OCR number/letter mix-ups only in the suffix
-                new_suffix = suffix.replace('O', '0').replace('o', '0').replace('I', '1').replace('i', '1').replace('l', '1')
-                word = prefix + new_suffix
+            matched_prefix = None
+            for pfx in known_prefixes:
+                if word.upper().startswith(pfx) or (len(word) >= 3 and difflib.SequenceMatcher(None, word[:len(pfx)].upper(), pfx).ratio() > 0.7):
+                    matched_prefix = pfx
+                    break
 
-            # Fix 2: Fix Sections (e.g., iPSY-A -> 1PSY-A, 2PSY-8 -> 2PSY-B)
+            if matched_prefix and len(word) >= 4:
+                suffix = word[len(matched_prefix):]
+                suffix = suffix.replace('O', '0').replace('o', '0')
+                suffix = suffix.replace('I', '1').replace('i', '1').replace('l', '1')
+                suffix = suffix.replace('G', '6').replace('S', '5')
+                word = matched_prefix + suffix
+
             if "-" in word:
                 parts = word.split('-')
                 if len(parts) == 2:
                     if parts[0] and parts[0][0] in ['i', 'I', 'l', 'L']:
                         parts[0] = '1' + parts[0][1:]
-                    if parts[1] == '8':
+                    if parts[1] in ['8', 'b']:
                         parts[1] = 'B'
+                    if parts[1] in ['0', 'o']:
+                        parts[1] = 'D'
                     word = "-".join(parts)
 
-            # Fix 3: Drop noise speckles (1-2 character lowercase gibberish)
-            if len(word) <= 2 and word.islower() and word not in ['a', 'to']:
+            if len(word) <= 3 and word.islower() and word not in ['a', 'to', 'am', 'pm']:
+                continue
+
+            if _re.fullmatch(r'[^A-Za-z0-9]+', word):
                 continue
 
             final_words.append(word)
 
         final_string = " ".join(final_words)
 
-        # --- DYNAMIC RULE 3: Garbage Filter (The Saturday Issue) ---
-        # The Saturday block is generating noise from empty table grid lines. 
-        # Gibberish usually breaks down into lots of tiny 1-3 letter chunks.
-        # If we have a long string of mostly tiny words, we erase it.
-        if len(final_words) > 4 and all(len(w) < 4 for w in final_words):
-            return "" 
+        matches2 = difflib.get_close_matches(final_string, known_phrases, n=1, cutoff=0.65)
+        if matches2:
+            return matches2[0]
+
+        if len(final_words) > 5:
+            short_words = sum(1 for w in final_words if len(w) <= 2)
+            has_long_word = any(len(w) >= 5 for w in final_words)
+            if short_words / len(final_words) > 0.6 and not has_long_word:
+                return ""
 
         return final_string
 
     def extract_data(self):
             print("[System] Reading Day Headers and Building Grid...")
 
-            # -------------------------------
-            # STEP 1: Generate clean time labels (30 slots)
-            # -------------------------------
             time_slots = self.generate_time_slots()
 
-            # -------------------------------
-            # STEP 2: Read Day Headers
-            # -------------------------------
             self.days = []
             for i, box in enumerate(self.day_boxes):
                 text = self.ocr_crop(box, f"day_{i}")
@@ -315,23 +388,15 @@ class ScheduleDataExtractor:
                     self.days.append({
                         'text': text,
                         'center_x': box[0] + (box[2] // 2),
-                        'bottom_y': box[1] + box[3] # Grab the bottom edge of the day text
+                        'bottom_y': box[1] + box[3]
                     })
 
             if not self.days:
                 print("[Error] Could not find day headers to anchor the schedule.")
                 return
 
-            # -------------------------------
-            # STEP 3: DYNAMIC GEOMETRIC GRID (The Fix)
-            # -------------------------------
-            # Find the average bottom Y of the day headers. This is where 06:00 AM starts.
             grid_top_y = sum(d['bottom_y'] for d in self.days) / len(self.days)
-            
-            # The grid ends at the bottom of the cropped image
             grid_bottom_y = self.img_h
-            
-            # Divide the total pixel height by 30 slots to find the exact height of 30 minutes
             total_grid_height = grid_bottom_y - grid_top_y
             row_height = total_grid_height / len(time_slots)
 
@@ -339,20 +404,15 @@ class ScheduleDataExtractor:
             print(" EXTRACTED SCHEDULE EVENTS")
             print("="*50)
 
-            # -------------------------------
-            # STEP 4: Process Events
-            # -------------------------------
             for i, event in enumerate(self.event_boxes):
                 x, y, w, h = event
 
-                # OCR EVENT TEXT
                 raw_event_text = self.ocr_crop(event, f"event_{i}")
                 event_text = self.clean_text(raw_event_text)
 
                 if len(event_text) < 4:
                     continue
 
-                # FIND DAY
                 event_center_x = x + (w // 2)
                 day_text = "Unknown Day"
                 if self.days:
@@ -362,25 +422,15 @@ class ScheduleDataExtractor:
                     )
                     day_text = closest_day['text']
 
-                # -------------------------------
-                # STEP 5: MATH-BASED TIME MAPPING
-                # -------------------------------
-                # We determine the start and end by dividing the Y pixels by the row height
                 start_index = int(round((y - grid_top_y) / row_height))
                 end_index = int(round((y + h - grid_top_y) / row_height))
 
-                # Clamp indices to ensure they don't crash if an event touches the exact bottom edge
                 start_index = max(0, min(start_index, len(time_slots) - 1))
                 end_index = max(start_index + 1, min(end_index, len(time_slots)))
 
                 start_time_text = time_slots[start_index][0]
-                
-                # The time_slots tuple holds (start_time, end_time). We grab the end_time of the final block.
                 end_time_text = time_slots[end_index - 1][1]
 
-                # -------------------------------
-                # OUTPUT
-                # -------------------------------
                 print(f"DAY:   {day_text}")
                 print(f"TIME:  {start_time_text} to {end_time_text}")
                 print(f"EVENT: {event_text}")
